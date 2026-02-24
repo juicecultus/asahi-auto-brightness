@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""
+auto-brightness — Ambient Light Sensor auto-brightness for Asahi Linux
+
+Reads ambient light level from iio-sensor-proxy (via D-Bus) and smoothly
+adjusts display brightness through KDE Plasma's ScreenBrightness D-Bus API.
+
+Designed for Apple Silicon laptops running Asahi Linux with the VD6286
+ALS sensor driven by the aop_als kernel module.
+
+Features:
+  - Smooth ramping via native D-Bus (no subprocess spawning in hot loop)
+  - Rolling average of lux readings to filter sensor noise
+  - Hysteresis to prevent oscillation near curve boundaries
+  - Respects manual slider changes (re-syncs each cycle)
+  - Minimum brightness floor to prevent black screen
+
+Usage:
+  auto-brightness                              # run in foreground
+  systemctl --user start auto-brightness       # via systemd
+
+Configuration:
+  Edit LUX_CURVE below to change the lux-to-brightness mapping.
+  Edit RAMP_RATE to change transition speed (KDE units per second).
+
+Requires:
+  - iio-sensor-proxy (provides net.hadess.SensorProxy on system bus)
+  - KDE Plasma 6+ (provides org.kde.ScreenBrightness on session bus)
+  - python3-dbus (provides dbus module)
+  - ALS sensor exposed via IIO (e.g. /sys/bus/iio/devices/iio:device1)
+"""
+
+import collections
+import dbus
+import signal
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# Tuning constants
+# ---------------------------------------------------------------------------
+
+POLL_INTERVAL = 1.0        # seconds between lux samples
+RAMP_RATE = 500            # KDE brightness units per second (10000 = full range)
+RAMP_TICK = 0.02           # seconds between brightness steps during ramp
+
+AVG_WINDOW = 5             # number of lux samples in rolling average
+HYSTERESIS_PCT = 8         # ignore target changes smaller than this (% of current)
+MIN_BRIGHTNESS = 200       # floor (KDE units out of 10000) — prevents black screen
+MAX_BRIGHTNESS = 10000
+
+# Lux → brightness % curve (linearly interpolated)
+# Adjust to taste; left = lux reading, right = screen brightness percent.
+LUX_CURVE = [
+    (0,     4),
+    (1,     6),
+    (5,    12),
+    (20,   22),
+    (50,   38),
+    (100,  52),
+    (200,  66),
+    (400,  80),
+    (700,  92),
+    (1000, 100),
+]
+
+# ---------------------------------------------------------------------------
+# D-Bus connection setup
+# ---------------------------------------------------------------------------
+
+def connect_dbus():
+    """Create persistent D-Bus proxy objects (session + system)."""
+    session_bus = dbus.SessionBus()
+    system_bus = dbus.SystemBus()
+
+    kde_obj = session_bus.get_object(
+        "org.kde.ScreenBrightness",
+        "/org/kde/ScreenBrightness/display0",
+    )
+    kde_display = dbus.Interface(kde_obj, "org.kde.ScreenBrightness.Display")
+    kde_props = dbus.Interface(kde_obj, "org.freedesktop.DBus.Properties")
+
+    sensor_obj = system_bus.get_object(
+        "net.hadess.SensorProxy",
+        "/net/hadess/SensorProxy",
+    )
+    sensor_iface = dbus.Interface(sensor_obj, "net.hadess.SensorProxy")
+    sensor_props = dbus.Interface(sensor_obj, "org.freedesktop.DBus.Properties")
+
+    return kde_display, kde_props, sensor_iface, sensor_props
+
+# ---------------------------------------------------------------------------
+# KDE ScreenBrightness helpers
+# ---------------------------------------------------------------------------
+
+def kde_get_brightness(kde_props):
+    """Read current brightness from KDE (returns int)."""
+    try:
+        return int(kde_props.Get("org.kde.ScreenBrightness.Display", "Brightness"))
+    except Exception:
+        return None
+
+def kde_set_brightness(kde_display, val):
+    """Set brightness via KDE D-Bus. val is clamped to [MIN, MAX]."""
+    val = max(MIN_BRIGHTNESS, min(int(val), MAX_BRIGHTNESS))
+    try:
+        kde_display.SetBrightness(dbus.Int32(val), dbus.UInt32(0))
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# iio-sensor-proxy helpers
+# ---------------------------------------------------------------------------
+
+def sensor_read_lux(sensor_props):
+    """Read current lux from iio-sensor-proxy (returns float or None)."""
+    try:
+        return float(sensor_props.Get("net.hadess.SensorProxy", "LightLevel"))
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+# Lux → brightness mapping
+# ---------------------------------------------------------------------------
+
+def lux_to_brightness(lux):
+    """Map a lux value to KDE brightness units (0–10000) via LUX_CURVE."""
+    if lux <= LUX_CURVE[0][0]:
+        pct = LUX_CURVE[0][1]
+    elif lux >= LUX_CURVE[-1][0]:
+        pct = LUX_CURVE[-1][1]
+    else:
+        pct = 50
+        for i in range(len(LUX_CURVE) - 1):
+            l0, b0 = LUX_CURVE[i]
+            l1, b1 = LUX_CURVE[i + 1]
+            if l0 <= lux <= l1:
+                t = (lux - l0) / (l1 - l0)
+                pct = b0 + t * (b1 - b0)
+                break
+    return max(MIN_BRIGHTNESS, min(MAX_BRIGHTNESS, int(round(pct / 100.0 * MAX_BRIGHTNESS))))
+
+# ---------------------------------------------------------------------------
+# Smooth ramping
+# ---------------------------------------------------------------------------
+
+def ramp_to(kde_display, current, target):
+    """
+    Smoothly ramp brightness from current to target.
+    Steps by RAMP_RATE * RAMP_TICK units per tick for consistent speed.
+    Returns the final brightness value.
+    """
+    step = max(1, int(RAMP_RATE * RAMP_TICK))
+    while current != target:
+        if current < target:
+            current = min(current + step, target)
+        else:
+            current = max(current - step, target)
+        kde_set_brightness(kde_display, current)
+        time.sleep(RAMP_TICK)
+    return current
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main():
+    print("auto-brightness: starting (native D-Bus, max=10000)", flush=True)
+
+    kde_display, kde_props, sensor_iface, sensor_props = connect_dbus()
+
+    # Claim the light sensor
+    try:
+        sensor_iface.ClaimLight()
+    except Exception:
+        pass
+
+    def cleanup(*_):
+        try:
+            sensor_iface.ReleaseLight()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    # Seed state from KDE
+    current_br = kde_get_brightness(kde_props)
+    if current_br is None:
+        print("auto-brightness: cannot read KDE brightness, exiting", flush=True)
+        sys.exit(1)
+    print(f"auto-brightness: initial brightness={current_br}/10000", flush=True)
+
+    lux_history = collections.deque(maxlen=AVG_WINDOW)
+    committed_target = current_br
+
+    while True:
+        lux = sensor_read_lux(sensor_props)
+        if lux is None:
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        lux_history.append(lux)
+        avg_lux = sum(lux_history) / len(lux_history)
+        target_br = lux_to_brightness(avg_lux)
+
+        # Re-sync: if user moved the slider manually, adopt their value
+        actual_br = kde_get_brightness(kde_props)
+        if actual_br is not None and abs(actual_br - current_br) > 50:
+            current_br = actual_br
+            committed_target = actual_br
+
+        # Hysteresis: only act if the new target differs enough from the
+        # last committed target to avoid oscillation.
+        threshold = max(200, int(committed_target * HYSTERESIS_PCT / 100))
+        if abs(target_br - committed_target) > threshold:
+            print(
+                f"lux={avg_lux:.1f} (raw={lux:.0f}) "
+                f"brightness {current_br}->{target_br}/10000",
+                flush=True,
+            )
+            current_br = ramp_to(kde_display, current_br, target_br)
+            committed_target = target_br
+
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
