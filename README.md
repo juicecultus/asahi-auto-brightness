@@ -8,25 +8,25 @@ Works with the **VD6286** ALS sensor found in M2 MacBook Air (13" and 15") and o
 
 ```
 VD6286 sensor → aop_als kernel module → IIO sysfs
-    → auto-brightness daemon (direct sysfs read/write)
-    → periodic KDE slider sync via D-Bus
+    → auto-brightness daemon (reads lux from IIO sysfs)
+    → KDE ScreenBrightness D-Bus API (SuppressIndicator flag)
 ```
 
-The daemon writes directly to the backlight sysfs interface, bypassing the desktop environment entirely. This prevents OSD (On-Screen Display) popups during automatic adjustments. It periodically syncs KDE's brightness slider via D-Bus after brightness stabilizes.
+The daemon reads lux directly from the IIO sensor sysfs node and controls brightness through KDE's D-Bus API with the `SuppressIndicator` flag — the slider tracks smoothly with no OSD popups.
 
-Key features (same architecture as [macbook-ambient-sensor](https://github.com/juicecultus/macbook-ambient-sensor)):
-- **No OSD popups** — direct sysfs writes bypass KDE/GNOME entirely
-- **Imperceptible transitions** — one small brightness step per poll cycle (2 units / 0.5s)
-- **Manual override** — respects user slider/key changes until ambient light shifts by ≥50% (or ≥5 lux absolute in low light)
-- **Periodic KDE sync** — slider stays accurate after brightness stabilizes (uses `SuppressIndicator` flag to avoid OSD)
+Key features (inspired by [macbook-ambient-sensor](https://github.com/juicecultus/macbook-ambient-sensor)):
+- **No OSD popups** — uses KDE `SetBrightness` with `SuppressIndicator` flag
+- **Imperceptible transitions** — 1% brightness steps every 0.25s
+- **Manual override** — respects user slider changes until ambient light shifts by ≥75% (or ≥5 lux absolute in low light)
+- **Smooth slider tracking** — KDE slider and display brightness stay perfectly in sync
 - **Minimum brightness floor** — prevents black screen
 
 ## Prerequisites
 
 - **Kernel**: Asahi fairydust branch with `CONFIG_IIO_AOP_SENSOR_ALS=m`
 - **Firmware**: `apple/aop-als-cal.bin` in `/lib/firmware/` (see [Extracting Calibration](#extracting-calibration-data))
-- **Packages**: `python3-dbus` (for optional KDE slider sync)
-- **Backlight permissions**: udev rule for writable sysfs (included)
+- **Packages**: `python3-dbus`
+- **Desktop**: KDE Plasma 6+
 
 ## Installation
 
@@ -49,10 +49,6 @@ sudo dracut --force --kver $(uname -r)
 ### 2. Install the auto-brightness daemon
 
 ```bash
-# Allow non-root backlight writes (required)
-sudo cp 99-backlight.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules
-
 # Install the script
 mkdir -p ~/.local/bin
 cp auto-brightness ~/.local/bin/auto-brightness
@@ -75,9 +71,6 @@ cat /sys/bus/iio/devices/iio:device1/in_illuminance_input
 
 # Daemon is running
 systemctl --user status auto-brightness
-
-# Backlight is writable
-ls -l /sys/class/backlight/apple-panel-bl/brightness
 ```
 
 ## Extracting Calibration Data
@@ -90,9 +83,12 @@ The calibration data is device-specific (per-unit factory calibration), so you m
 
 ## Desktop Integration
 
-The daemon writes brightness directly to sysfs, completely bypassing the desktop environment. This prevents the brightness OSD from appearing during automatic adjustments. Manual brightness changes via the KDE slider or keyboard shortcuts still work normally and are respected by the daemon — it pauses auto-brightness until the ambient light changes significantly.
+The daemon controls brightness through KDE's `SetBrightness` D-Bus method with the `SuppressIndicator` flag (`flag=1`). This means:
+- The KDE brightness slider tracks the display brightness in real time
+- No OSD (On-Screen Display) popup appears during automatic adjustments
+- Manual brightness changes via the slider are detected and respected
 
-After brightness stabilizes, the daemon syncs the KDE slider via D-Bus (with `SuppressIndicator` flag) so the slider position stays accurate.
+If you change the slider manually, auto-brightness pauses until ambient light changes by ≥75%. This prevents the daemon from immediately overriding your preference.
 
 ## Customizing the Brightness Curve
 
@@ -119,12 +115,11 @@ Values are linearly interpolated between points.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `POLL_INTERVAL` | 0.5s | How often to read the sensor |
-| `SMOOTH_STEP` | 2 | Sysfs brightness units per cycle |
-| `LUX_CHANGE_PCT` | 50% | Lux change to resume after manual override |
+| `POLL_INTERVAL` | 0.25s | How often to read the sensor |
+| `SMOOTH_STEP` | 100 | KDE brightness units per cycle (1% of 10000) |
+| `LUX_CHANGE_PCT` | 75% | Lux change to resume after manual override |
 | `LUX_CHANGE_MIN` | 5 | Minimum absolute lux change (low-light) |
-| `MIN_BRIGHTNESS` | 10 | Floor brightness (sysfs units) |
-| `STABLE_SYNC_AFTER` | 10 | Cycles before syncing KDE slider (~5s) |
+| `MIN_BRIGHTNESS` | 200 | Floor brightness (KDE units out of 10000) |
 
 ## Tested Hardware
 
@@ -134,9 +129,9 @@ Values are linearly interpolated between points.
 
 **ALS reads 0 lux**: Missing or wrong calibration file. Re-extract from macOS.
 
-**Brightness doesn't change**: Check backlight permissions: `ls -l /sys/class/backlight/apple-panel-bl/brightness` should be world-writable. Check `systemctl --user status auto-brightness` for errors.
+**Brightness doesn't change**: Make sure KDE Plasma is running. Check `systemctl --user status auto-brightness` for errors.
 
-**Manual slider ignored**: The daemon detects slider changes and enters manual override mode. It resumes auto-brightness when ambient light changes by ≥50%.
+**Manual slider ignored**: The daemon detects slider changes and enters manual override mode. It resumes auto-brightness when ambient light changes by ≥75%.
 
 ## License
 
