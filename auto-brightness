@@ -37,7 +37,7 @@ import time
 # Hardware paths
 # ---------------------------------------------------------------------------
 
-SENSOR_FILE = "/sys/bus/iio/devices/iio:device1/in_illuminance_input"
+SENSOR_FILE = None  # auto-detected at startup
 
 # ---------------------------------------------------------------------------
 # Tuning constants
@@ -147,10 +147,30 @@ def lux_changed_enough(current_lux, override_lux):
 # Main loop
 # ---------------------------------------------------------------------------
 
+def find_sensor():
+    """Auto-detect the IIO ALS sensor path (device number varies across boots)."""
+    import glob
+    for dev in sorted(glob.glob("/sys/bus/iio/devices/iio:device*")):
+        name_file = os.path.join(dev, "name")
+        lux_file = os.path.join(dev, "in_illuminance_input")
+        if os.path.exists(lux_file):
+            name = ""
+            try:
+                with open(name_file) as f:
+                    name = f.read().strip()
+            except Exception:
+                pass
+            return lux_file, name
+    return None, None
+
 def main():
-    if not os.path.exists(SENSOR_FILE):
-        print(f"auto-brightness: missing {SENSOR_FILE}", flush=True)
+    global SENSOR_FILE
+    sensor_path, sensor_name = find_sensor()
+    if sensor_path is None:
+        print("auto-brightness: no IIO illuminance sensor found", flush=True)
         sys.exit(1)
+    SENSOR_FILE = sensor_path
+    print(f"auto-brightness: found sensor '{sensor_name}' at {sensor_path}", flush=True)
 
     display, props = kde_connect()
 
