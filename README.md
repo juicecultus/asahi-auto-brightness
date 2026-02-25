@@ -16,7 +16,7 @@ The daemon reads lux directly from the IIO sensor sysfs node and controls bright
 
 Key features (inspired by [macbook-ambient-sensor](https://github.com/juicecultus/macbook-ambient-sensor)):
 - **No OSD popups** — uses KDE `SetBrightness` with `SuppressIndicator` flag
-- **Imperceptible transitions** — 1% brightness steps every 0.25s
+- **Imperceptible transitions** — 0.5% brightness steps every 0.25s
 - **Manual override** — respects user slider changes until ambient light shifts by ≥75% (or ≥5 lux absolute in low light)
 - **Smooth slider tracking** — KDE slider and display brightness stay perfectly in sync
 - **Minimum brightness floor** — prevents black screen
@@ -116,7 +116,7 @@ Values are linearly interpolated between points.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `POLL_INTERVAL` | 0.25s | How often to read the sensor |
-| `SMOOTH_STEP` | 100 | KDE brightness units per cycle (1% of 10000) |
+| `SMOOTH_STEP` | 50 | KDE brightness units per cycle (0.5% of 10000) |
 | `LUX_CHANGE_PCT` | 75% | Lux change to resume after manual override |
 | `LUX_CHANGE_MIN` | 5 | Minimum absolute lux change (low-light) |
 | `MIN_BRIGHTNESS` | 200 | Floor brightness (KDE units out of 10000) |
