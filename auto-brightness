@@ -2,228 +2,251 @@
 """
 auto-brightness — Ambient Light Sensor auto-brightness for Asahi Linux
 
-Reads ambient light level from iio-sensor-proxy (via D-Bus) and smoothly
-adjusts display brightness through KDE Plasma's ScreenBrightness D-Bus API.
+Writes directly to the backlight sysfs interface for OSD-free automatic
+brightness adjustments. Reads lux from the IIO sensor sysfs node.
+Periodically syncs KDE's brightness slider after brightness stabilizes.
+
+Architecture (mirrors juicecultus/macbook-ambient-sensor):
+  - Direct sysfs writes bypass the DE entirely → no OSD popups
+  - One brightness step per poll cycle → imperceptible transitions
+  - Manual override: respects user slider/key changes until ambient
+    light shifts by ≥50% (or ≥5 lux absolute in low light)
+  - Periodic KDE D-Bus sync keeps the slider accurate
 
 Designed for Apple Silicon laptops running Asahi Linux with the VD6286
 ALS sensor driven by the aop_als kernel module.
-
-Features:
-  - Smooth ramping via native D-Bus (no subprocess spawning in hot loop)
-  - Rolling average of lux readings to filter sensor noise
-  - Hysteresis to prevent oscillation near curve boundaries
-  - Respects manual slider changes (re-syncs each cycle)
-  - Minimum brightness floor to prevent black screen
 
 Usage:
   auto-brightness                              # run in foreground
   systemctl --user start auto-brightness       # via systemd
 
-Configuration:
-  Edit LUX_CURVE below to change the lux-to-brightness mapping.
-  Edit RAMP_RATE to change transition speed (KDE units per second).
-
 Requires:
-  - iio-sensor-proxy (provides net.hadess.SensorProxy on system bus)
-  - KDE Plasma 6+ (provides org.kde.ScreenBrightness on session bus)
-  - python3-dbus (provides dbus module)
-  - ALS sensor exposed via IIO (e.g. /sys/bus/iio/devices/iio:device1)
+  - Kernel with aop_als module (IIO ALS sensor)
+  - Writable backlight sysfs (udev rule or root)
+  - python3-dbus (for optional KDE slider sync)
 """
 
-import collections
-import dbus
+import os
 import signal
 import sys
 import time
 
 # ---------------------------------------------------------------------------
+# Hardware paths — auto-detected at startup
+# ---------------------------------------------------------------------------
+
+BACKLIGHT_DIR = "/sys/class/backlight/apple-panel-bl"
+SENSOR_FILE = "/sys/bus/iio/devices/iio:device1/in_illuminance_input"
+
+# ---------------------------------------------------------------------------
 # Tuning constants
 # ---------------------------------------------------------------------------
 
-POLL_INTERVAL = 1.0        # seconds between lux samples
-RAMP_RATE = 500            # KDE brightness units per second (10000 = full range)
-RAMP_TICK = 0.02           # seconds between brightness steps during ramp
+POLL_INTERVAL = 0.5         # seconds between sensor reads
+SMOOTH_STEP = 2             # sysfs brightness units per cycle
 
-AVG_WINDOW = 5             # number of lux samples in rolling average
-HYSTERESIS_PCT = 8         # ignore target changes smaller than this (% of current)
-MIN_BRIGHTNESS = 200       # floor (KDE units out of 10000) — prevents black screen
-MAX_BRIGHTNESS = 10000
+LUX_CHANGE_PCT = 50         # % lux change to resume after manual override
+LUX_CHANGE_MIN = 5          # absolute lux change minimum (for dark conditions)
 
-# Lux → brightness % curve (linearly interpolated)
-# Adjust to taste; left = lux reading, right = screen brightness percent.
+MIN_BRIGHTNESS = 10         # floor (sysfs units) — prevents black screen
+OVERRIDE_TOLERANCE = 5      # sysfs units; ignore actual vs written diff below this
+STABLE_SYNC_AFTER = 10      # sync KDE slider after N stable cycles (~5 seconds)
+
+# Lux → brightness curve (sysfs units, max read from sysfs at startup).
+# Values are given as percentage of max_brightness; converted at startup.
 LUX_CURVE = [
-    (0,     4),
-    (1,     6),
-    (5,    12),
-    (20,   22),
-    (50,   38),
-    (100,  52),
-    (200,  66),
+    (0,     2),
+    (1,     3),
+    (5,     6),
+    (20,   12),
+    (50,   24),
+    (100,  40),
+    (200,  60),
     (400,  80),
     (700,  92),
     (1000, 100),
 ]
 
 # ---------------------------------------------------------------------------
-# D-Bus connection setup
+# Sysfs helpers
 # ---------------------------------------------------------------------------
 
-def connect_dbus():
-    """Create persistent D-Bus proxy objects (session + system)."""
-    session_bus = dbus.SessionBus()
-    system_bus = dbus.SystemBus()
-
-    kde_obj = session_bus.get_object(
-        "org.kde.ScreenBrightness",
-        "/org/kde/ScreenBrightness/display0",
-    )
-    kde_display = dbus.Interface(kde_obj, "org.kde.ScreenBrightness.Display")
-    kde_props = dbus.Interface(kde_obj, "org.freedesktop.DBus.Properties")
-
-    sensor_obj = system_bus.get_object(
-        "net.hadess.SensorProxy",
-        "/net/hadess/SensorProxy",
-    )
-    sensor_iface = dbus.Interface(sensor_obj, "net.hadess.SensorProxy")
-    sensor_props = dbus.Interface(sensor_obj, "org.freedesktop.DBus.Properties")
-
-    return kde_display, kde_props, sensor_iface, sensor_props
-
-# ---------------------------------------------------------------------------
-# KDE ScreenBrightness helpers
-# ---------------------------------------------------------------------------
-
-def kde_get_brightness(kde_props):
-    """Read current brightness from KDE (returns int)."""
+def read_int(path):
+    """Read an integer from a sysfs file (returns None on failure)."""
     try:
-        return int(kde_props.Get("org.kde.ScreenBrightness.Display", "Brightness"))
+        with open(path, "r") as f:
+            return int(f.read().strip())
     except Exception:
         return None
 
-def kde_set_brightness(kde_display, val):
-    """Set brightness via KDE D-Bus. val is clamped to [MIN, MAX]."""
-    val = max(MIN_BRIGHTNESS, min(int(val), MAX_BRIGHTNESS))
+def write_int(path, value):
+    """Write an integer to a sysfs file."""
     try:
-        kde_display.SetBrightness(dbus.Int32(val), dbus.UInt32(0))
+        with open(path, "w") as f:
+            f.write(str(value))
+    except Exception as e:
+        print(f"auto-brightness: sysfs write error: {e}", flush=True)
+
+# ---------------------------------------------------------------------------
+# KDE slider sync (optional, best-effort)
+# ---------------------------------------------------------------------------
+
+def kde_sync_brightness(sysfs_val, max_br):
+    """Sync KDE's brightness slider to match current sysfs value.
+
+    Uses flag=1 (SuppressIndicator) to avoid OSD popup.
+    Maps sysfs value (0–max_br) to KDE scale (0–10000).
+    """
+    try:
+        import dbus
+        kde_val = int(round(sysfs_val / max_br * 10000))
+        kde_val = max(0, min(10000, kde_val))
+        bus = dbus.SessionBus()
+        obj = bus.get_object(
+            "org.kde.ScreenBrightness",
+            "/org/kde/ScreenBrightness/display0",
+        )
+        iface = dbus.Interface(obj, "org.kde.ScreenBrightness.Display")
+        iface.SetBrightness(dbus.Int32(kde_val), dbus.UInt32(1))
     except Exception:
         pass
-
-# ---------------------------------------------------------------------------
-# iio-sensor-proxy helpers
-# ---------------------------------------------------------------------------
-
-def sensor_read_lux(sensor_props):
-    """Read current lux from iio-sensor-proxy (returns float or None)."""
-    try:
-        return float(sensor_props.Get("net.hadess.SensorProxy", "LightLevel"))
-    except Exception:
-        return None
 
 # ---------------------------------------------------------------------------
 # Lux → brightness mapping
 # ---------------------------------------------------------------------------
 
-def lux_to_brightness(lux):
-    """Map a lux value to KDE brightness units (0–10000) via LUX_CURVE."""
-    if lux <= LUX_CURVE[0][0]:
-        pct = LUX_CURVE[0][1]
-    elif lux >= LUX_CURVE[-1][0]:
-        pct = LUX_CURVE[-1][1]
-    else:
-        pct = 50
-        for i in range(len(LUX_CURVE) - 1):
-            l0, b0 = LUX_CURVE[i]
-            l1, b1 = LUX_CURVE[i + 1]
-            if l0 <= lux <= l1:
-                t = (lux - l0) / (l1 - l0)
-                pct = b0 + t * (b1 - b0)
-                break
-    return max(MIN_BRIGHTNESS, min(MAX_BRIGHTNESS, int(round(pct / 100.0 * MAX_BRIGHTNESS))))
+def build_curve(max_br):
+    """Convert percentage-based LUX_CURVE to absolute sysfs units."""
+    return [(lux, max(MIN_BRIGHTNESS, int(round(pct / 100.0 * max_br))))
+            for lux, pct in LUX_CURVE]
+
+def lux_to_brightness(lux, curve):
+    """Map a lux value to sysfs brightness units via the curve."""
+    if lux <= curve[0][0]:
+        return curve[0][1]
+    if lux >= curve[-1][0]:
+        return curve[-1][1]
+    for i in range(len(curve) - 1):
+        l0, b0 = curve[i]
+        l1, b1 = curve[i + 1]
+        if l0 <= lux <= l1:
+            t = (lux - l0) / (l1 - l0)
+            return int(round(b0 + t * (b1 - b0)))
+    return curve[-1][1]
 
 # ---------------------------------------------------------------------------
-# Smooth ramping
+# Manual override detection
 # ---------------------------------------------------------------------------
 
-def ramp_to(kde_display, current, target):
-    """
-    Smoothly ramp brightness from current to target.
-    Steps by RAMP_RATE * RAMP_TICK units per tick for consistent speed.
-    Returns the final brightness value.
-    """
-    step = max(1, int(RAMP_RATE * RAMP_TICK))
-    while current != target:
-        if current < target:
-            current = min(current + step, target)
-        else:
-            current = max(current - step, target)
-        kde_set_brightness(kde_display, current)
-        time.sleep(RAMP_TICK)
-    return current
+def lux_changed_enough(current_lux, override_lux):
+    """Check if ambient light has changed enough to resume auto-brightness."""
+    delta = abs(current_lux - override_lux)
+    if delta < LUX_CHANGE_MIN:
+        return False
+    if override_lux == 0:
+        return True
+    return (delta * 100 / override_lux) >= LUX_CHANGE_PCT
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
 def main():
-    print("auto-brightness: starting (native D-Bus, max=10000)", flush=True)
+    # Validate hardware paths
+    brightness_file = os.path.join(BACKLIGHT_DIR, "brightness")
+    actual_file = os.path.join(BACKLIGHT_DIR, "actual_brightness")
+    max_file = os.path.join(BACKLIGHT_DIR, "max_brightness")
 
-    kde_display, kde_props, sensor_iface, sensor_props = connect_dbus()
+    for path in [SENSOR_FILE, brightness_file, max_file]:
+        if not os.path.exists(path):
+            print(f"auto-brightness: missing {path}", flush=True)
+            sys.exit(1)
 
-    # Claim the light sensor
-    try:
-        sensor_iface.ClaimLight()
-    except Exception:
-        pass
-
-    def cleanup(*_):
-        try:
-            sensor_iface.ReleaseLight()
-        except Exception:
-            pass
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, cleanup)
-    signal.signal(signal.SIGINT, cleanup)
-
-    # Seed state from KDE
-    current_br = kde_get_brightness(kde_props)
-    if current_br is None:
-        print("auto-brightness: cannot read KDE brightness, exiting", flush=True)
+    max_br = read_int(max_file)
+    if max_br is None or max_br <= 0:
+        print("auto-brightness: cannot read max_brightness", flush=True)
         sys.exit(1)
-    print(f"auto-brightness: initial brightness={current_br}/10000", flush=True)
 
-    lux_history = collections.deque(maxlen=AVG_WINDOW)
-    committed_target = current_br
+    curve = build_curve(max_br)
+    print(f"auto-brightness: sysfs direct, max={max_br}, "
+          f"step={SMOOTH_STEP}, poll={POLL_INTERVAL}s", flush=True)
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    last_written = -1
+    manual_override = False
+    override_lux = 0
+    sysfs_synced = False
+    stable_count = 0
 
     while True:
-        lux = sensor_read_lux(sensor_props)
+        time.sleep(POLL_INTERVAL)
+
+        lux = read_int(SENSOR_FILE)
         if lux is None:
-            time.sleep(POLL_INTERVAL)
+            continue
+        # Read the brightness file (what was last written), NOT actual_brightness
+        # (which includes a hardware offset on apple-panel-bl and would cause
+        # the daemon to chase its own tail).
+        current = read_int(brightness_file)
+        if current is None:
             continue
 
-        lux_history.append(lux)
-        avg_lux = sum(lux_history) / len(lux_history)
-        target_br = lux_to_brightness(avg_lux)
+        # Detect manual override: brightness file changed from what we wrote.
+        # This means the user (or KDE) wrote a new value via slider/keys.
+        if last_written >= 0 and abs(current - last_written) > OVERRIDE_TOLERANCE:
+            if not manual_override:
+                print(f"auto-brightness: manual override detected "
+                      f"(ours {last_written}, now {current})", flush=True)
+            manual_override = True
+            override_lux = lux
+            last_written = current
+            sysfs_synced = True
+            stable_count = 0
+            continue
 
-        # Re-sync: if user moved the slider manually, adopt their value
-        actual_br = kde_get_brightness(kde_props)
-        if actual_br is not None and abs(actual_br - current_br) > 50:
-            current_br = actual_br
-            committed_target = actual_br
+        # If in manual override, only resume when light changes substantially
+        if manual_override:
+            if lux_changed_enough(lux, override_lux):
+                print(f"auto-brightness: resuming (lux {override_lux}->{lux})",
+                      flush=True)
+                manual_override = False
+            else:
+                continue
 
-        # Hysteresis: only act if the new target differs enough from the
-        # last committed target to avoid oscillation.
-        threshold = max(200, int(committed_target * HYSTERESIS_PCT / 100))
-        if abs(target_br - committed_target) > threshold:
-            print(
-                f"lux={avg_lux:.1f} (raw={lux:.0f}) "
-                f"brightness {current_br}->{target_br}/10000",
-                flush=True,
-            )
-            current_br = ramp_to(kde_display, current_br, target_br)
-            committed_target = target_br
+        target = lux_to_brightness(lux, curve)
 
-        time.sleep(POLL_INTERVAL)
+        # Already at target: count stable cycles, sync KDE slider after a while
+        if current == target:
+            last_written = current
+            if not sysfs_synced:
+                stable_count += 1
+                if stable_count >= STABLE_SYNC_AFTER:
+                    actual = read_int(actual_file) or current
+                    kde_sync_brightness(actual, max_br)
+                    sysfs_synced = True
+                    # KDE may write back to sysfs; re-read to avoid false override
+                    time.sleep(0.2)
+                    readback = read_int(brightness_file)
+                    if readback is not None:
+                        last_written = readback
+                    print(f"auto-brightness: synced KDE slider ({actual}/{max_br})",
+                          flush=True)
+            continue
+
+        # Brightness needs to change
+        sysfs_synced = False
+        stable_count = 0
+
+        if current < target:
+            new = min(current + SMOOTH_STEP, target)
+        else:
+            new = max(current - SMOOTH_STEP, target)
+
+        new = max(MIN_BRIGHTNESS, new)
+        write_int(brightness_file, new)
+        last_written = new
 
 
 if __name__ == "__main__":
