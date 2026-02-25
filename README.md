@@ -20,6 +20,7 @@ Key features (inspired by [macbook-ambient-sensor](https://github.com/juicecultu
 - **Manual override** — respects user slider changes until ambient light shifts by ≥75% (or ≥5 lux absolute in low light)
 - **Smooth slider tracking** — KDE slider and display brightness stay perfectly in sync
 - **Minimum brightness floor** — prevents black screen
+- **Auto-detects sensor** — IIO device number varies across reboots; found automatically
 
 ## Prerequisites
 
@@ -66,8 +67,8 @@ systemctl --user enable --now auto-brightness.service
 After reboot, verify:
 
 ```bash
-# ALS sensor is active
-cat /sys/bus/iio/devices/iio:device1/in_illuminance_input
+# ALS sensor is active (device number may vary)
+cat /sys/bus/iio/devices/iio:device*/in_illuminance_input
 
 # Daemon is running
 systemctl --user status auto-brightness
@@ -92,7 +93,7 @@ If you change the slider manually, auto-brightness pauses until ambient light ch
 
 ## Customizing the Brightness Curve
 
-Edit the `LUX_CURVE` table in `auto-brightness`. Values are percentages of `max_brightness` (read from sysfs at startup):
+Edit the `LUX_CURVE` table in `auto-brightness`. Values are percentages of KDE's brightness range (0–10000):
 
 ```python
 LUX_CURVE = [
@@ -129,7 +130,9 @@ Values are linearly interpolated between points.
 
 **ALS reads 0 lux**: Missing or wrong calibration file. Re-extract from macOS.
 
-**Brightness doesn't change**: Make sure KDE Plasma is running. Check `systemctl --user status auto-brightness` for errors.
+**Daemon crash-loops after reboot**: The IIO device number may change. The daemon auto-detects it, but if the `aop_als` module loads late, the daemon will retry every 5 seconds (`Restart=always`).
+
+**Brightness doesn't change**: Make sure KDE Plasma is running. Check `systemctl --user status auto-brightness` and `journalctl --user -u auto-brightness` for errors.
 
 **Manual slider ignored**: The daemon detects slider changes and enters manual override mode. It resumes auto-brightness when ambient light changes by ≥75%.
 
