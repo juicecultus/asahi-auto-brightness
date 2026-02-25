@@ -44,7 +44,7 @@ SENSOR_FILE = "/sys/bus/iio/devices/iio:device1/in_illuminance_input"
 # ---------------------------------------------------------------------------
 
 POLL_INTERVAL = 0.25        # seconds between sensor reads
-SMOOTH_STEP = 100           # KDE brightness units per cycle (1% of 10000)
+SMOOTH_STEP = 50            # KDE brightness units per cycle (0.5% of 10000)
 
 LUX_CHANGE_PCT = 75         # % lux change to resume after manual override
 LUX_CHANGE_MIN = 5          # absolute lux change minimum (for dark conditions)
